@@ -2,6 +2,7 @@ import logging
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import threading
 
 from livekit.agents import (
     Agent,
@@ -14,35 +15,66 @@ from livekit.agents import (
 )
 from livekit.plugins import google, silero
 
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# Logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("realtime-video-agent")
 
+# Environment
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
+# Global session
+_global_session = None
+
+# FastAPI app
+app = FastAPI()
+
+class FillerWordsUpdate(BaseModel):
+    words: list[str]
+    action: str
+
+@app.post("/api/filler-words")
+async def update_filler_words(update: FillerWordsUpdate):
+    if _global_session is None:
+        raise HTTPException(status_code=503, detail="Session not initialized")
+    
+    if update.action == "add":
+        _global_session.add_filler_words(update.words)
+        return {"status": "added", "count": len(update.words)}
+    elif update.action == "remove":
+        _global_session.remove_filler_words(update.words)
+        return {"status": "removed", "count": len(update.words)}
+    elif update.action == "replace":
+        _global_session.set_filler_words(update.words)
+        return {"status": "replaced", "count": len(update.words)}
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+@app.get("/api/filler-words")
+async def get_filler_words():
+    if _global_session is None:
+        raise HTTPException(status_code=503, detail="Session not initialized")
+    return {"filler_words": list(_global_session.get_filler_words())}
+
+def run_api_server():
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
 async def entrypoint(ctx: JobContext):
-    # UPDATED: Complete filler list with "yes", "aha", etc.
+    global _global_session
+    
     multilingual_fillers = [
-        # English - basic
         'uh', 'um', 'umm', 'hmm', 'ah', 'oh', 'huh', 'hm',
-        # English - extended variations
         'mhm', 'mmhmm', 'mm', 'mmm', 'uhuh',
         'er', 'erm', 'uhh', 'uhm',
-        # English - affirmatives (often used as fillers)
-        'yeah', 'yep', 'yup', 'yes', 'aha', 'mhmm',  # ✅ ADDED
+        'yeah', 'yep', 'yup', 'yes', 'aha', 'mhmm',
         'uh huh', 'mm hmm', 'uh-huh', 'mm-hmm',
-        
-        # Hindi (Devanagari script)
         'हम्म', 'उम', 'अह', 'हां', 'हाँ', 'हम', 'उह', 'ठीक',
-        
-        # Gujarati
         'હમ્મ', 'ઉમ', 'અહ',
-        
-        # Romanized Hindi/Urdu
         'haan', 'han', 'theek', 'acha',
-        
-        # Conversational fillers
         'like', 'you know', 'i mean',
     ]
     
@@ -51,46 +83,35 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(
         vad=silero.VAD.load(),
         llm=google.realtime.RealtimeModel(),
-        ignored_filler_words=multilingual_fillers,
+        _ignored_filler_words=multilingual_fillers,
     )
     
-    # ... rest of your code ...
-
-
+    _global_session = session
+    
+    # START API SERVER HERE
+    api_thread = threading.Thread(target=run_api_server, daemon=True)
+    api_thread.start()
+    logger.info("🌐 API server started on http://localhost:8000")
+    
     agent = Agent(
-        instructions="You are a helpful AI assistant. Keep responses clear and concise.",
+        instructions="You are a helpful AI assistant. Keep responses clear and a medium size response.",
     )
-
-    # Event listeners for visibility
+    
     @session.on("user_input_transcribed")
     def on_transcript(event):
-        logger.info(
-            "user transcript",
-            extra={
-                "transcript": event.transcript,
-                "is_final": event.is_final
-            }
-        )
+        logger.info("user transcript", extra={"transcript": event.transcript, "is_final": event.is_final})
     
-    @session.on("agent_started_speaking")
-    def on_agent_start():
-        logger.info("🗣️ Agent started speaking - filler filtering ACTIVE")
-    
-    @session.on("agent_stopped_speaking")
-    def on_agent_stop():
-        logger.info("🔇 Agent stopped speaking - filler filtering INACTIVE")
-
     await session.start(
         agent=agent,
         room=ctx.room,
         room_input_options=RoomInputOptions(video_enabled=False),
         room_output_options=RoomOutputOptions(transcription_enabled=True),
     )
-
-    await session.generate_reply(
-        instructions="Greet the user and ask how you can help"
-    )
-
+    
+    try:
+        await session.generate_reply(instructions="Greet the user and ask how you can help")
+    except Exception as e:
+        logger.error(f"Failed to generate greeting: {e}")
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

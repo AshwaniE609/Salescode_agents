@@ -5,6 +5,7 @@ import asyncio
 import copy
 import json
 import time
+import unicodedata
 from collections.abc import AsyncIterable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass
@@ -174,7 +175,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         loop: asyncio.AbstractEventLoop | None = None,
         # deprecated
         agent_false_interruption_timeout: NotGivenOr[float | None] = NOT_GIVEN,
-        ignored_filler_words: NotGivenOr[list[str]] = NOT_GIVEN,
+        _ignored_filler_words: NotGivenOr[list[str]] = NOT_GIVEN,
     ) -> None:
         """`AgentSession` is the LiveKit Agents runtime that glues together
         media streams, speech/LLM components, and tool orchestration into a
@@ -349,9 +350,21 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         self._global_run_state: RunResult | None = None
 
-        default_fillers = ['uh', 'umm', 'hmm', 'haan', 'um', 'ah']
+        default_fillers = [
+            # English
+            'uh', 'um', 'umm', 'hmm', 'ah', 'oh', 'huh', 'hm',
+            'mhm', 'mmhmm', 'mm', 'mmm', 'uhuh', 'er', 'erm',
+            'yeah', 'yep', 'yup', 'yes', 'aha', 'mhmm',
+            # Hindi (romanized)
+            'haan', 'han', 'theek', 'acha',
+            # Hindi (Devanagari)
+            'हां', 'हाँ', 'हम्म', 'उम', 'अह', 'ठीक',
+            # Gujarati
+            'હમ્મ', 'ઉમ', 'અહ',
+        ]
+
         self._ignored_filler_words = (
-            set(ignored_filler_words) if is_given(ignored_filler_words) 
+            set(_ignored_filler_words) if is_given(_ignored_filler_words) 
             else set(default_fillers)
         )
         self._agent_is_speaking = False
@@ -909,52 +922,102 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         )
 
     
+    def is_filler_only(self, transcript: str) -> bool:
+        """
+        Check if transcript contains only filler words.
+        Supports multi-language mixed input (e.g., "umm हां okay").
 
-    def _is_filler_only(self, transcript: str) -> bool:
-        """Check if transcript contains only filler words.
-        
-        Requirements:
-        - Remove punctuation and normalize
-        - Support multi-language fillers
-        - Return False if ANY non-filler word exists (for mixed input)
-        - Case-insensitive matching
-        
         Args:
-            transcript: Raw transcript text from STT
+            transcript: The text to check
             
         Returns:
-            True if ALL words are fillers, False otherwise
+            True if transcript contains only filler words, False otherwise
         """
         if not transcript or not transcript.strip():
             return True
-        
-        # Normalize: lowercase and remove extra whitespace
+            
+        # Normalize: lowercase and strip
         normalized = transcript.lower().strip()
+            
+        # Remove ALL punctuation including Unicode punctuation
+        # This regex handles: English, Hindi, Gujarati, Chinese, etc.
         
-        # Remove punctuation and split into words
-        # This handles cases like "Mhm.", "Uh-huh.", "umm,"
-        words = re.findall(r'\w+', normalized)  # Extract only alphanumeric words
-        
-        # If no words after cleaning, treat as empty/filler
+        # Remove punctuation characters
+        cleaned_text = ''.join(
+            char if unicodedata.category(char) not in ['Po', 'Ps', 'Pe', 'Pf', 'Pi', 'Pc'] 
+            else ' '
+            for char in normalized
+        )
+            
+        # Extract words (handles Unicode properly)
+        words = cleaned_text.split()
+            
         if not words:
             return True
-        
-        # Check if ALL words are in the filler list
-        # This ensures mixed input like "umm okay stop" returns False
+            
+        # Check if ALL words are fillers
         is_filler = all(word in self._ignored_filler_words for word in words)
-        
-        # Debug logging
-        if is_filler:
-            logger.debug(
-                "identified as filler-only",
-                extra={
-                    "original": transcript,
-                    "cleaned_words": words,
-                    "all_fillers": is_filler
-                }
-            )
-        
+            
+        logger.debug(
+            f"Filler check: transcript='{transcript}', "
+            f"words={words}, is_filler={is_filler}"
+        )
+            
         return is_filler
+    
+    def add_filler_words(self, words: list[str]) -> None:
+        """
+        Dynamically add filler words to the filter list at runtime.
+    
+        Args:
+            words: List of filler words to add
+        """
+        before_count = len(self._ignored_filler_words)
+        self._ignored_filler_words.update(word.lower() for word in words)
+        after_count = len(self._ignored_filler_words)
+        added_count = after_count - before_count
+    
+        logger.info(
+            f"Added {added_count} new filler words. "
+            f"Total filler words: {after_count}"
+        )
+    
+    def remove_filler_words(self, words: list[str]) -> None:
+        """
+        Dynamically remove filler words from the filter list at runtime.
+    
+        Args:
+            words: List of filler words to remove
+        """
+        before_count = len(self._ignored_filler_words)
+        for word in words:
+            self._ignored_filler_words.discard(word.lower())
+        after_count = len(self._ignored_filler_words)
+        removed_count = before_count - after_count
+    
+        logger.info(
+            f"Removed {removed_count} filler words. "
+            f"Total filler words: {after_count}"
+        )
+    
+    def get_filler_words(self) -> set[str]:
+        """
+        Get current list of filler words.
+    
+        Returns:
+            Set of current filler words
+        """
+        return self._ignored_filler_words.copy()
+    
+    def set_filler_words(self, words: list[str]) -> None:
+        """
+        Replace the entire filler word list.
+    
+        Args:
+            words: New list of filler words
+        """
+        self._ignored_filler_words = set(word.lower() for word in words)
+        logger.info(f"Filler words list replaced. Total: {len(self._ignored_filler_words)}")
 
     def update_agent(self, agent: Agent) -> None:
         self._agent = agent
@@ -1171,22 +1234,21 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
     # Add this enhanced logging to see the exact flow:
 
     def _user_input_transcribed(self, ev: UserInputTranscribedEvent) -> None:
-        logger.debug(f"🔔 _user_input_transcribed called: '{ev.transcript}'")
-        logger.debug(f"   is_final={ev.is_final}, agent_speaking={self._agent_is_speaking}")
+        logger.debug(f"_user_input_transcribed: text='{ev.transcript}', "
+                    f"is_final={ev.is_final}, agent_speaking={self._agent_is_speaking}")
         
-        # ✅ CRITICAL: Filter fillers for BOTH interim and final transcripts
-        # This prevents ANY filler-related interruption
-        if self._agent_is_speaking:  # ← Removed: and ev.is_final
-            if self._is_filler_only(ev.transcript):
-                logger.info(f"✅ FILLER IGNORED: '{ev.transcript}' (final={ev.is_final})")
-                return  # Complete silence - agent won't react at all
+        # ✅ ONLY filter when agent is speaking AND transcript is final
+        if self._agent_is_speaking and ev.is_final:
+            if self.is_filler_only(ev.transcript):
+                logger.info(f"🚫 FILLER IGNORED: '{ev.transcript}'")
+                return  # Prevents emission → no interruption
         
-        logger.debug(f"📤 Emitting user_input_transcribed for: '{ev.transcript}'")
-        
+        # Normal flow
         if self.user_state == "away" and ev.is_final:
             self.update_user_state("listening")
         
-        self.emit("user_input_transcribed", ev)
+        self.emit("_user_input_transcribed", ev)
+
 
     def _conversation_item_added(self, message: llm.ChatMessage) -> None:
         self._chat_ctx.insert(message)
